@@ -1,7 +1,7 @@
 
 
 
-# SpringBoot + Redis模拟 10w 人的秒杀抢单！
+# SpringBoot + Redis模拟 10w 人的秒杀抢单！(lettuce实现)
 
 
 
