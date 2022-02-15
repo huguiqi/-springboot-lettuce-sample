@@ -1,7 +1,7 @@
 package com.example.demo.controller;
 
 
-import com.example.demo.common.JedisCommand;
+import com.example.demo.common.LettuceCommand;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.util.StringUtils;
@@ -23,7 +23,7 @@ import java.util.stream.IntStream;
 public class MiaoShaController {
 
     @Autowired
-    private JedisCommand jedisCommand;
+    private LettuceCommand lettuceCommand;
 
     //总库存
     private long nKuCuen = 0;
@@ -77,7 +77,7 @@ public class MiaoShaController {
             if (nKuCuen <= 0) {
                 break;
             }
-            if (jedisCommand.setnx(shangpingKey, b)) {
+            if (lettuceCommand.setnx(shangpingKey, b)) {
                 //用户b拿到锁
                 log.info("用户{}拿到锁...", b);
                 try {
@@ -103,7 +103,7 @@ public class MiaoShaController {
                 } finally {
                     log.info("用户{}释放锁...", b);
                     //释放锁
-                    jedisCommand.delnx(shangpingKey, b);
+                    lettuceCommand.delnx(shangpingKey, b);
                 }
             } else {
                 //用户b没拿到锁，在超时范围内继续请求锁，不需要处理

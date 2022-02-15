@@ -1,7 +1,7 @@
 package com.example.demo.controller;
 
 import com.example.demo.bean.Car;
-import com.example.demo.common.JedisCommand;
+import com.example.demo.common.LettuceCommand;
 import com.example.demo.mapper.primary.CarMapper;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -20,7 +20,7 @@ public class HelloController {
     private CarMapper carMapper;
 
     @Autowired
-    private JedisCommand jedisCommand;
+    private LettuceCommand lettuceCommand;
 
     @RequestMapping("/")
     public String index() {
@@ -31,13 +31,13 @@ public class HelloController {
 
     @GetMapping("/setnx/{key}/{val}")
     public boolean setnx(@PathVariable String key, @PathVariable String val) {
-        return jedisCommand.setnx(key, val);
+        return lettuceCommand.setnx(key, val);
     }
 
 
     @GetMapping("/delnx/{key}/{val}")
     public int delnx(@PathVariable String key, @PathVariable String val) {
-        return jedisCommand.delnx(key, val);
+        return lettuceCommand.delnx(key, val);
     }
 
 
