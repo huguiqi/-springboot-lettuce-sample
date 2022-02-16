@@ -40,7 +40,7 @@ jedis的nx生成锁
 </dependency>
 ```
 
-它包含了jedis客户端依赖包。
+它默认使用lettuce作为client实现redis连接，包含了lettuce客户端依赖包。
 
 
 
@@ -62,47 +62,74 @@ jedis的nx生成锁
 
   
 
-下面来上段setnx操作的代码：
+由于lettuce客户端本身并不提供`setnx`的接口实现，只能通过spring-data-redis的底层来实现`setnx`操作，下面来上段setnx操作的代码：
 
 ```java
     @Autowired
-    private JedisConnectionFactory jedisConnectionFactory;
-
-    private Jedis getJedis() {
-        JedisConnection  jedisConnection = (JedisConnection)jedisConnectionFactory.getConnection();
-        return jedisConnection.getNativeConnection();
-    }
+    private RedisTemplate redisTemplate;
 
     public boolean setnx(String key, String val) {
-        Jedis jedis = this.getJedis();
         try {
-            if (jedis == null) {
-                return false;
-            }
-            String ret = jedis.set(key, val, "NX", "PX", 1000 * 60);
-            if (StringUtils.isEmpty(ret)){
-                return false;
-            }else
-                return ret.equalsIgnoreCase("ok");
+            int timemout = 60;
+            boolean ret = redisTemplate.opsForValue().setIfAbsent(key,val,timemout, TimeUnit.SECONDS);
+            return ret;
         } catch (Exception ex) {
             log.error("setnx error!!,key={},val={}",key,val,ex);
-        } finally {
-            if (jedis != null) {
-                jedis.close();
-            }
         }
         return false;
     }
 ```
 
+为什么这段代码就实现了`setnx`的操作呢？这段代码主要看`setIfAbsent(args...)`方法,我们点进去源码看看:
 
+```
+public Boolean setIfAbsent(K key, V value, long timeout, TimeUnit unit) {
+        byte[] rawKey = this.rawKey(key);
+        byte[] rawValue = this.rawValue(value);
+        Expiration expiration = Expiration.from(timeout, unit);
+        return (Boolean)this.execute((connection) -> {
+            return connection.set(rawKey, rawValue, expiration, SetOption.ifAbsent());
+        }, true);
+    }
 
+```
+源码分析：
+1. 调用了这个AbstractOperations类的execute方法：
+    
+    ```
+        @Nullable
+       <T> T execute(RedisCallback<T> callback, boolean exposeConnection) {
+           return this.template.execute(callback, exposeConnection);
+       }
+   ```
 
+2. `RedisCallback` 中使用RedisConnection去执行redis
+    
+   在它实现的callback中，发现connection.set有个参数：`SetOption.ifAbsent()`
 
-这里注意点在于jedis的set方法，其参数的说明如：
+文档中看到`RedisStringCommands.SetOption`的api说明:
 
-- NX：是否存在key，存在就不set成功
-- PX：key过期时间单位设置为毫秒（EX：单位秒）
+```
+public static enum RedisStringCommands.SetOption
+extends Enum<RedisStringCommands.SetOption>
+SET command arguments for NX, XX.
+Since:
+1.7
+Author:
+Christoph Strobl
+Enum Constant Summary
+Enum Constants
+Enum Constant and Description
+SET_IF_ABSENT
+NX
+SET_IF_PRESENT
+XX
+UPSERT
+Do not set any additional command argument.
+```
+
+就是说`ifAbsent`方法就是`setnx`支持
+
 
 setnx如果失败直接封装返回false即可，下面我们通过一个get方式的api来调用下这个setnx方法：
 
@@ -111,7 +138,7 @@ setnx如果失败直接封装返回false即可，下面我们通过一个get方�
 ```java
 @GetMapping("/setnx/{key}/{val}")
 public boolean setnx(@PathVariable String key, @PathVariable String val) {
-   return jedisCommand.setnx(key, val);
+   return lettuceCommand.setnx(key, val);
 }
 ```
 
@@ -137,51 +164,50 @@ public boolean setnx(@PathVariable String key, @PathVariable String val) {
 
 
 
-上面是创建锁，同样的具有有效时间，但是我们不能完全依赖这个有效时间，场景如：有效时间设置1分钟，本身用户A获取锁后，没遇到什么特殊情况正常生成了抢购订单后，此时其他用户应该能正常下单了才对，但是由于有个1分钟后锁才能自动释放，那其他用户在这1分钟无法正常下单（因为锁还是A用户的），因此我们需要A用户操作完后，主动去解锁：
+上面是创建锁，同样的具有有效时间，但是我们不能完全依赖这个有效时间，场景如：有效时间设置1分钟，本身用户A获取锁后，没遇到什么特殊情况正常生成了抢购订单后，此时其他用户应该能正常下单了才对，但是由于有个1分钟后锁才能自动释放，那其他用户在这1分钟无法正常下单（因为锁还是A用户的），因此我们需要A用户操作完后，主动去解锁。
 
-
+需要借助lua脚本去删除key，来达到解除锁的目的，而且必须是同一个用户才能解锁：
 
 
 
 ```java
-	public int delnx(String key, String val) {
-        Jedis jedis = this.getJedis();
+    public int delnx(String key, String val) {
         try {
-            if (jedis == null) {
-                return 0;
-            }
-        //if redis.call('get','orderkey')=='1111' then return redis.call('del','orderkey') else return 0 end
-        StringBuilder sbScript = new StringBuilder();
-        sbScript.append("if redis.call('get','").append(key).append("')").append("=='").append(val).append("'").
-                append(" then ").
-               append("    return redis.call('del','").append(key).append("')").
-                append(" else ").
-                append("    return 0").
-                append(" end");
+            //if redis.call('get','orderkey')=='1111' then return redis.call('del','orderkey') else return 0 end
+            StringBuilder sbScript = new StringBuilder();
+            sbScript.append("if redis.call('get',KEYS[1])").append("==ARGV[1]").
+                    append(" then ").
+                    append("    return redis.call('del',KEYS[1])").
+                    append(" else ").
+                    append("    return 0").
+                    append(" end");
 
-        return Integer.valueOf(jedis.eval(sbScript.toString()).toString());
-    } catch (Exception ex) {
-            log.error("delnx error!!,key={},value={}",key,val,ex);
-    } finally {
-        if (jedis != null) {
-            jedis.close();
+            DefaultRedisScript<Long> redisScript = new DefaultRedisScript<>(sbScript.toString(),Long.class);
+            Long ret = (Long) redisTemplate.execute(redisScript, Collections.singletonList(key),val);
+            Integer result = 0;
+            if (null != ret) {
+                result = Integer.valueOf(ret.intValue());
+            }
+            return result;
+        } catch (Exception ex) {
+            log.error("delnx error!!,key={},value={}", key, val, ex);
         }
-   }
-    return 0;
+        return 0;
     }
+
 ```
 
 
 
-这里也使用了jedis方式，直接执行lua脚本：根据val判断其是否存在，如果存在就del；
-其实个人认为通过jedis的get方式获取val后，然后再比较value是否是当前持有锁的用户，如果是那最后再删除，效果其实相当；只不过直接通过eval执行脚本，这样避免多一次操作了redis而已，缩短了原子操作的间隔。(如有不同见解请留言探讨)；同样这里创建个get方式的api来测试：
+这里不能像jedis的方式一样，必须通过设置变量取值来设置lua脚本：根据key和val判断其是否存在，如果存在就del；
+其实个人认为通过redis的get方式获取val后，然后再比较value是否是当前持有锁的用户，如果是那最后再删除，效果其实相当；只不过直接通过eval执行脚本，这样避免多一次操作了redis而已，缩短了原子操作的间隔。(如有不同见解请留言探讨)；同样这里创建个get方式的api来测试：
 
 
 
 ```java
 @GetMapping("/delnx/{key}/{val}")
 public int delnx(@PathVariable String key, @PathVariable String val) {
-   return jedisCommand.delnx(key, val);
+   return lettuceCommand.delnx(key, val);
 }
 ```
 
@@ -251,7 +277,7 @@ public int delnx(@PathVariable String key, @PathVariable String val) {
             if (nKuCuen <= 0) {
                 break;
             }
-            if (jedisCommand.setnx(shangpingKey, b)) {
+            if (lettuceCommand.setnx(shangpingKey, b)) {
                 //用户b拿到锁
                 logger.info("用户{}拿到锁...", b);
                 try {
@@ -277,7 +303,7 @@ public int delnx(@PathVariable String key, @PathVariable String val) {
                 } finally {
                     logger.info("用户{}释放锁...", b);
                     //释放锁
-                    jedisCommand.delnx(shangpingKey, b);
+                    lettuceCommand.delnx(shangpingKey, b);
                 }
             } else {
                 //用户b没拿到锁，在超时范围内继续请求锁，不需要处理
@@ -298,9 +324,9 @@ public int delnx(@PathVariable String key, @PathVariable String val) {
 
 3、获取锁前和后都判断库存是否还足够
 
-4、jedisCom.setnx(shangpingKey, b)：用户获取抢购锁
+4、lettuceCommand.setnx(shangpingKey, b)：用户获取抢购锁
 
-5、获取锁后并下单成功，最后释放锁：jedisCom.delnx(shangpingKey, b)
+5、获取锁后并下单成功，最后释放锁：lettuceCommand.delnx(shangpingKey, b)
 
 再来看下记录的日志结果：
 
@@ -315,178 +341,40 @@ public int delnx(@PathVariable String key, @PathVariable String val) {
 ![图片](https://tva1.sinaimg.cn/large/008i3skNgy1gz68tch07vj30jl01qmxc.jpg)
 
 
+## jedis和lettuce性能比较
+
+抢单jedis实现耗时：
+   第一次：10736ms
+   第二次：10218ms
+   第三次：10330ms
+   第四次：10660ms
+   第五次：10177ms
+   平均：10424.2ms
+
+lettuce实现耗时：
+    第一次: 10186ms
+	第二次：10240ms
+	第三次：10307ms
+	第四次：10518ms
+	第五次：10187ms
+    平均: 10287.6ms   
+
+综合下来，lettuce的响应要稍微快些。
 
 
 
-[实现代码地址](https://github.com/huguiqi/springboot-jedis-sample)
+[实现代码地址](https://github.com/huguiqi/springboot-lettuce-sample)
 
 
 
 [博客地址](https://clockcoder.com/2022/02/07/SpringBoot%20+%20Redis%E6%A8%A1%E6%8B%9F%2010w%20%E4%BA%BA%E7%9A%84%E7%A7%92%E6%9D%80%E6%8A%A2%E5%8D%95/)
 
 
-## 集成jedis遇到的问题
+## 集成lettuce遇到的问题
 
-在模拟测试10万人秒杀时，遇到一个jedis关闭时的连接池报错：
-
-    ``` 
-        JedisException:Could not return the resource to the pool 。。。IllegalStateException: Invalidated object not currently part of this pool
-    ```
-
-我 [参考此文章](https://blog.csdn.net/beguile/article/details/80614651) ，表示需要显示的将jedisPool进行资源回收处理，但是根据我的实践，并未起效果，所以根本原因并不是线程池未回收导致
-
-所以继续找了下原因，感觉还是jedis里的连接状态与实际不一致导致的。
-
-[参考这篇文章](https://mistray.github.io/2020/08/21/Jedis%E8%BF%9E%E6%8E%A5%E6%B1%A0%E7%AB%9F%E7%84%B6%E4%BC%9A%E8%B5%84%E6%BA%90%E6%B3%84%E9%9C%B2/)
-
-最终原因终于找到了, 查看源码`Jedis 2.9.0` 的Jedis.class:
-
-    public void close() {
-        if (this.dataSource != null) {
-            JedisPoolAbstract pool = this.dataSource;
-            if (this.client.isBroken()) {
-                pool.returnBrokenResource(this);
-            } else {
-                pool.returnResource(this);
-            }
-        } else {
-            super.close();
-        }
-
-    }
-
-
-
-通过断点进行发现, this.dataSource永远都是空的，也就是主逻辑永远进不来,结合上面参考的文章，结合我的问题，分析如下：
-
-1. 因为jedis我之前是设置为静态共享的，所以当下个线程继续使用jedis时，有线程将socket关闭了，就会导致连接失败
-2. 多线程问题导致jedis中的datasource被提前回收，另一线程发现没有了datasource，就把socket给关闭了
-3. 未设置jedis客户端线程池参数, 最大可用线程池数量太少，有可能导致获取线程失败
-4. 由于使用springboot 1.5.6.RELEASE 版本，而我的jedis是通过spring-boot-starter-data-redis引入的，它所使用的jedis版本是: `2.9.0`,而 `jedis 2.10.2` 以下版本都有此问题，属于bug
-
-根据这四个问题，我是不是只要将jedis升级到2.10.2以后，还是使用静态共享的jedis变量，就可以解决这个问题了呢？
-其实1，2是表象，最有可能的就是版本问题导致的，那么我就将jedis进行升级。
-
-## 升级springboot和jedis版本
-
-pom.xml:
-
-    <parent>
-		<groupId>org.springframework.boot</groupId>
-		<artifactId>spring-boot-starter-parent</artifactId>
-		<version>2.3.5.RELEASE</version>
-		<relativePath/> <!-- lookup parent from repository -->
-	</parent>
-	
-	<dependency>
-    			<groupId>org.springframework.boot</groupId>
-    			<artifactId>spring-boot-starter-data-redis</artifactId>
-    			<exclusions>
-    				<exclusion>
-    					<groupId>io.lettuce</groupId>
-    					<artifactId>lettuce-core</artifactId>
-    				</exclusion>
-    			</exclusions>
-    </dependency>
-    
-    <dependency>
-    			<groupId>redis.clients</groupId>
-    			<artifactId>jedis</artifactId>
-    			<version>3.3.0</version>
-    </dependency>
-	
-* ps: 由于springboot 2.x 就默认将lettuce替换了jedis，为了防止包冲突，将lettuce exclude掉 *
-
-然后再将RedisConfig.java进行改造：
-
-```
-    @Bean
-    JedisConnectionFactory jedisConnectionFactory() {
-
-        // 设置最大600个连接
-        jedisPoolConfig.setMaxTotal(600);
-        jedisPoolConfig.setMaxIdle(300);
-        jedisPoolConfig.setTestOnBorrow(true);
-        jedisPoolConfig.setTestOnReturn(false);
-
-        JedisClientConfiguration.JedisPoolingClientConfigurationBuilder jpcf = (JedisClientConfiguration.JedisPoolingClientConfigurationBuilder) JedisClientConfiguration.builder();
-        jpcf.poolConfig(jedisPoolConfig);
-        JedisClientConfiguration jedisClientConfiguration = jpcf.build();
-
-        RedisStandaloneConfiguration redisStandaloneConfiguration = new RedisStandaloneConfiguration();
-        redisStandaloneConfiguration.setHostName("10.105.141.164");
-        redisStandaloneConfiguration.setPort(16379);
-        redisStandaloneConfiguration.setPassword("redis123");
-        JedisConnectionFactory jedisConnectionFactory = new JedisConnectionFactory(redisStandaloneConfiguration,jedisClientConfiguration);
-
-        return jedisConnectionFactory;
-    }
-```
-    
-JedisCommand.java中将jedis.set方法改成:
-
-    SetParams setParams = SetParams.setParams().nx().px(1000 * 60);
-    String ret = jedis.set(key, val, setParams);
-
-
-Jedis变量设置为静态变量，作为线程共享：
-    
-    private static Jedis jedis;
-    
-     private Jedis getJedis() {
-        if(jedis == null){
-            JedisConnection  jedisConnection = (JedisConnection)jedisConnectionFactory.getConnection();
-            this.jedis = jedisConnection.getNativeConnection();
-            return this.jedis;
-        }
-       return jedis;     
-     }
-
-
-再次启动并执行后，发现并没有解决这个问题，那看来jedis的socket关闭后，无法重新进行连接了。
-我看了jedis 3.3的close方法，和jedis 9.3.0的没有什么区别，并不是那位大哥说的那样。
-我将jedis改成方法级别变量后，就不再出现这个问题了。
-
-那还有种办法，是不是可以将jedis里的datasource生成，让它走主逻辑，就可以重新建立连接呢?
-看源码，jedis里的datasource就是：Pool<Jedis> 类型，也就是个线程池，这说明我配置的线程池没起效？
-原因：
-由于我在JedisCommand类中使用的`JedisConnectionFactory` 类去获取Jedis实例的，而`JedisConnectionFactory`本身就不是线程池，是连接工厂类，所以我一直拿的是连接，并不是连接池
-
-解决，RedisConfig.java中加入：
-    
-``` @Bean
-    JedisPool jedisPool(){
-        JedisPoolConfig jedisPoolConfig = new JedisPoolConfig();
-        // 设置最大60个连接
-        jedisPoolConfig.setMaxTotal(600);
-        jedisPoolConfig.setMaxIdle(300);
-        jedisPoolConfig.setTestOnBorrow(true);
-        jedisPoolConfig.setTestOnReturn(false);
-        JedisPool pool = new JedisPool(jedisPoolConfig, "10.105.141.164",16379,1000,"redis123");
-        return pool;
-    }
-```
-
-JedisCommand.java修改：
-
-```    private Jedis getJedis() {
-            return jedisPool.getResource();
-    }
-```
-将Jedis实例从池中获取，作为共享静态变量经测试还是会报错，至此，得出结论，不能将Jedis作为共享实例来使用，因为调用`jedis.close()`后，client的socket的就断了，而且在关闭socket之前已经将线程连接还给了线程池。
-
-正确使用jedis：
-    1. jedis即用即取,用完就关
-    2. jedis实例不可作为共享变量来使用,调用close后，无法重连获取连接
-    3. jedis实例其实就是JedisPool中的客户端连接，不应该为作共享变量来使用
-
-总结下来解决方案：
-
-  将jedis变量的作用域放到方法级别，方法执行完就回收掉
-  本代码是使用的这种方式解决的，经过`jedis2.9.0`版本到`jedis 3.3.0`的升级与测试，最终得出结论：设置为方法级变量后，就不再出现那个报错了(即用即取，用完还掉，并关掉socket连接)。
     
  
- [实现代码地址](https://github.com/huguiqi/springboot-jedis-sample)
+ [实现代码地址](https://github.com/huguiqi/springboot-lettuce-sample)
  
 
 
