@@ -11,8 +11,17 @@
 
 
 
-## Jedis的nx生成锁
+## Jedis的nx原生命令实现
 
+> 原理
+
+**setnx** 命令是redis的一条原生命令
+ 大意为 **set if not exists**， 在指定的key不存在的情况下，为key设置值
+ 使用如下
+
+```shell
+redis 127.0.0.1:6379> SETNX KEY_NAME VALUE
+```
 
 
 如何删除锁
@@ -127,6 +136,7 @@ XX
 UPSERT
 Do not set any additional command argument.
 ```
+![image-20220216155748958](https://tva1.sinaimg.cn/large/e6c9d24egy1gzga4ypkj3j21700mwq6i.jpg)
 
 就是说`ifAbsent`方法就是`setnx`支持
 
@@ -377,5 +387,18 @@ lettuce实现耗时：
  [实现代码地址](https://github.com/huguiqi/springboot-lettuce-sample)
  
 
+## jedis和lettuce、redisson的区别
 
 
+
+| 客户端   | 底层实现                                                     | 优点                                                         | 缺点                                                         |
+| -------- | ------------------------------------------------------------ | ------------------------------------------------------------ | ------------------------------------------------------------ |
+| jedis    | sockets直连服务器                                            | 1. 老牌客户端，提供了比较全面的 Redis 命令的支持 <br />2. 用户基数大，社区支持较成熟 | 1. 使用阻塞的 I/O,调用同步,但事务和管道方式调用是异步的<br />2. 线程不安全,必须使用连接池 |
+| lettuce  | netty nio异步框架实现                                        | 1. 支持同步异步通信模式<br />2. API 线程安全，如果不是执行阻塞和事务操作,多线程共享一个连接 | 1. 对redis高级使用支持不友好<br />2. 框架较新，社区支持没有jedis成熟 |
+| redisson | 基于netty和redis 3.0以上版本协议实现的驻内存数据网格（In-Memory Data Grid） | 1. 支持同步异步通信模式<br />2. API 线程安全，如果不是执行阻塞和事务操作,多线程共享一个连接<br />3. 使用者对 Redis 的关注分离,提供很多分布式相关操作服务，例如，分布式锁，分布式集合，可通过Redis支持延迟队列等。<br />4. 用户基数同样很大,文档齐全 | 框架较重，学习成本较高                                       |
+
+
+
+https://redisson.org/
+
+https://github.com/redisson/redisson
